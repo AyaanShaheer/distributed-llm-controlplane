@@ -1,0 +1,340 @@
+syntax = "proto3";
+
+package controlplane.v1;
+
+option go_package = "github.com/ayaan/distributed-llm-controlplane/api/proto/v1;controlplanev1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// ============================================================================
+// Enums
+// ============================================================================
+
+// ServingBackend selects the inference engine powering the Triton model instance.
+enum ServingBackend {
+  BACKEND_UNSPECIFIED = 0; // Defaults to TRT_LLM during validation.
+  TRT_LLM             = 1; // NVIDIA TensorRT-LLM (C++ kernels, MPI orchestrator).
+  VLLM                = 2; // vLLM engine (PagedAttention, Python runtime).
+}
+
+// Quantization specifies the numerical precision for model weights and KV-cache.
+enum Quantization {
+  QUANTIZATION_UNSPECIFIED = 0; // Rejected during validation; must be explicit.
+  FP16                     = 1; // IEEE 754 half-precision (2 bytes/param).
+  BF16                     = 2; // Brain floating-point (2 bytes/param, wider dynamic range).
+  FP8_E4M3                 = 3; // Hopper FP8 format (1 byte/param).
+  FP8_E5M2                 = 4; // Hopper FP8 format (1 byte/param, wider range).
+  INT4_AWQ                 = 5; // 4-bit Activation-aware Weight Quantization.
+  INT4_GPTQ                = 6; // 4-bit GPTQ post-training quantization.
+}
+
+// ArrivalDistribution controls the synthetic traffic pattern for load injection.
+enum ArrivalDistribution {
+  DISTRIBUTION_UNSPECIFIED = 0; // Defaults to POISSON during validation.
+  UNIFORM                  = 1; // Constant inter-arrival time (closed-loop).
+  POISSON                  = 2; // Exponential inter-arrival (open-loop, realistic).
+  BURST                    = 3; // Pareto-distributed bursts with quiet intervals.
+  TRACE_REPLAY             = 4; // Replay real request timestamps from a trace file.
+}
+
+// ExperimentState tracks the lifecycle of a profiling experiment.
+// State transitions are strictly ordered and irreversible once terminal.
+//
+// Valid transitions:
+//   PENDING -> PROVISIONING -> DEPLOYING -> WARMING_UP ->
+//   BENCHMARKING -> COLLECTING -> TEARING_DOWN -> COMPLETED
+//
+// Any state can transition to FAILED (terminal).
+// CANCELLED is reachable from any non-terminal state.
+enum ExperimentState {
+  STATE_UNSPECIFIED = 0;
+  PENDING           = 1;  // Experiment accepted, queued for execution.
+  PROVISIONING      = 2;  // Allocating GPU nodes via Slurm/K8s.
+  DEPLOYING         = 3;  // Launching Triton containers on allocated nodes.
+  WARMING_UP        = 4;  // Running warmup inference requests (JIT compilation, CUDA graph capture).
+  BENCHMARKING      = 5;  // Active load injection and metric collection.
+  COLLECTING        = 6;  // Draining in-flight requests and finalizing metrics.
+  TEARING_DOWN      = 7;  // Releasing GPU allocations and destroying containers.
+  COMPLETED         = 8;  // Terminal: experiment finished successfully.
+  FAILED            = 9;  // Terminal: experiment failed with error.
+  CANCELLED         = 10; // Terminal: experiment cancelled by user or system.
+}
+
+// ============================================================================
+// Core Messages
+// ============================================================================
+
+// ModelSpec identifies the target LLM and its serving configuration.
+message ModelSpec {
+  // Human-readable model identifier (e.g., "llama-3-8b-instruct").
+  // Must match pattern: ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$
+  string model_name = 1;
+
+  // Absolute path or URI to the model repository (e.g., /models/llama-3-8b or s3://bucket/llama-3-8b).
+  string model_path = 2;
+
+  // Maximum context window length in tokens (e.g., 8192, 131072).
+  // Used for KV-cache sizing validation. Must be > 0.
+  uint32 max_seq_len = 3;
+
+  // Number of transformer layers (used for memory estimation). Must be > 0.
+  uint32 num_layers = 4;
+
+  // Number of KV attention heads (GQA heads, not query heads). Must be > 0.
+  uint32 num_kv_heads = 5;
+
+  // Dimension of each attention head (e.g., 128). Must be > 0.
+  uint32 head_dim = 6;
+
+  // Total parameter count (e.g., 8_030_000_000 for Llama-3-8B).
+  uint64 total_parameters = 7;
+}
+
+// SweepDimensions defines the axes of the parameter sweep matrix.
+// The control plane iterates over the Cartesian product of all dimensions.
+// Total cells = |tp_degrees| × |batch_sizes| × |quantizations| must not exceed 256.
+message SweepDimensions {
+  // Tensor parallelism degrees to test. Each must be a power of 2 and ≥ 1.
+  repeated uint32 tp_degrees = 1;
+
+  // Maximum batch sizes to configure for in-flight batching. Each must be ≥ 1.
+  repeated uint32 batch_sizes = 2;
+
+  // Quantization formats to benchmark. Empty defaults to [FP16].
+  repeated Quantization quantizations = 3;
+
+  // KV-cache GPU memory fraction (0.0–1.0). Default 0.85 if unset.
+  // Controls `kv_cache_free_gpu_mem_fraction` in Triton config.
+  float kv_cache_mem_fraction = 4;
+}
+
+// TrafficProfile configures the synthetic load injection parameters.
+message TrafficProfile {
+  // Number of concurrent inference streams. Must be ≥ 1 and ≤ 2048.
+  uint32 concurrency = 1;
+
+  // Duration of the sustained load injection window. Must be ≥ 10s.
+  google.protobuf.Duration duration = 2;
+
+  // Number of input tokens per request (prompt length). Must be ≥ 1.
+  uint32 prompt_length = 3;
+
+  // Maximum output tokens to generate per request. Must be ≥ 1.
+  uint32 max_output_tokens = 4;
+
+  // Traffic arrival pattern.
+  ArrivalDistribution arrival_distribution = 5;
+
+  // Target queries per second (open-loop mode). Mutually exclusive with concurrency-based closed-loop.
+  // If set, `concurrency` must be 0.
+  float target_qps = 6;
+
+  // Number of warmup requests to send before measurement begins (not counted in metrics).
+  uint32 warmup_requests = 7;
+}
+
+// PerformanceBudget defines the SLA thresholds for CI/CD regression gating.
+message PerformanceBudget {
+  // Maximum acceptable p99 Time-To-First-Token in milliseconds. Must be > 0.
+  double max_p99_ttft_ms = 1;
+
+  // Maximum acceptable p95 Inter-Token Latency in milliseconds. Must be > 0.
+  double max_p95_itl_ms = 2;
+
+  // Minimum acceptable output token throughput (tokens/sec). Must be > 0.
+  double min_throughput_tokens_per_sec = 3;
+
+  // Maximum allowed regression percentage vs. baseline. Must be in (0, 100].
+  double regression_threshold_pct = 4;
+
+  // Reference baseline experiment ID to compare against. Optional.
+  string baseline_experiment_id = 5;
+}
+
+// ExperimentSpec is the top-level request payload submitted to the control plane.
+// It fully describes a profiling experiment: what model, how to sweep, and how to load-test.
+message ExperimentSpec {
+  // Unique experiment identifier. Auto-generated by server if empty.
+  string experiment_id = 1;
+
+  // Target model definition.
+  ModelSpec model = 2;
+
+  // Sweep parameter matrix. At least one dimension must be populated.
+  SweepDimensions sweep = 3;
+
+  // Serving backend engine to use.
+  ServingBackend backend = 4;
+
+  // Load injection configuration.
+  TrafficProfile traffic = 5;
+
+  // Optional CI/CD performance regression budget.
+  PerformanceBudget budget = 6;
+
+  // Free-form labels for experiment tagging and filtering.
+  map<string, string> labels = 7;
+
+  // If true, run in CI mode: enforce budget, fail on regression.
+  bool ci_mode = 8;
+}
+
+// ============================================================================
+// Telemetry & Results
+// ============================================================================
+
+// LatencyHistogram captures the distribution of a latency metric.
+message LatencyHistogram {
+  double p50_ms  = 1;
+  double p90_ms  = 2;
+  double p95_ms  = 3;
+  double p99_ms  = 4;
+  double p999_ms = 5;
+  double min_ms  = 6;
+  double max_ms  = 7;
+  double mean_ms = 8;
+  double stddev_ms = 9;
+  uint64 sample_count = 10;
+}
+
+// GPUMetrics captures hardware-level telemetry for a single GPU during a benchmark cell.
+message GPUMetrics {
+  uint32 gpu_index          = 1;  // Physical GPU index on the node.
+  string gpu_uuid           = 2;  // NVIDIA GPU UUID.
+  double sm_utilization_pct = 3;  // Average SM active percentage.
+  double mem_utilization_pct = 4; // Average memory controller utilization.
+  double fb_used_mb         = 5;  // Average framebuffer (VRAM) used in MB.
+  double fb_total_mb        = 6;  // Total framebuffer capacity in MB.
+  double power_draw_watts   = 7;  // Average power consumption.
+  double gpu_temp_celsius   = 8;  // Average GPU temperature.
+  uint64 throttle_reasons   = 9;  // Bitmask of DCGM throttle reason codes.
+}
+
+// CellResult holds the benchmark output for a single (TP, BatchSize, Quant) configuration.
+message CellResult {
+  // The configuration that was tested.
+  uint32 tp_degree          = 1;
+  uint32 batch_size         = 2;
+  Quantization quantization = 3;
+
+  // Whether this cell completed successfully.
+  bool success              = 4;
+
+  // If failed, the error reason (e.g., "CUDA_OOM", "TRITON_CRASH", "TIMEOUT").
+  string error_reason       = 5;
+
+  // Serving performance metrics (populated only if success == true).
+  LatencyHistogram ttft     = 6;  // Time-To-First-Token distribution.
+  LatencyHistogram itl      = 7;  // Inter-Token Latency distribution.
+  double output_tokens_per_sec = 8;  // Aggregate output throughput.
+  double total_tokens_per_sec  = 9;  // Total tokens (prompt + output) throughput.
+
+  // Hardware telemetry per GPU during this cell's benchmark window.
+  repeated GPUMetrics gpu_metrics = 10;
+
+  // Wall-clock duration of this cell's benchmark.
+  google.protobuf.Duration cell_duration = 11;
+}
+
+// ExperimentReport is the final output of a completed experiment.
+message ExperimentReport {
+  string experiment_id                     = 1;
+  ExperimentSpec spec                      = 2;
+  ExperimentState final_state              = 3;
+  repeated CellResult results              = 4;
+  google.protobuf.Timestamp started_at     = 5;
+  google.protobuf.Timestamp completed_at   = 6;
+
+  // The Pareto-optimal configuration recommendation.
+  CellResult recommended_config            = 7;
+
+  // If CI mode, the budget evaluation result.
+  RegressionReport regression              = 8;
+}
+
+// RegressionReport compares current results against a baseline for CI/CD gating.
+message RegressionReport {
+  bool passed                         = 1;  // true if all budgets met.
+  string baseline_experiment_id       = 2;
+  double ttft_delta_pct               = 3;  // Positive = regression (slower).
+  double itl_delta_pct                = 4;
+  double throughput_delta_pct         = 5;  // Negative = regression (lower).
+  repeated string violations          = 6;  // Human-readable violation messages.
+}
+
+// ============================================================================
+// gRPC Service Definition
+// ============================================================================
+
+service OrchestratorService {
+  // SubmitExperiment validates and enqueues a new profiling experiment.
+  // Returns the experiment handle with server-assigned ID.
+  rpc SubmitExperiment(SubmitExperimentRequest) returns (SubmitExperimentResponse);
+
+  // GetExperimentStatus retrieves the current state of an experiment.
+  rpc GetExperimentStatus(GetExperimentStatusRequest) returns (GetExperimentStatusResponse);
+
+  // StreamMetrics opens a server-side stream of live telemetry samples during benchmarking.
+  rpc StreamMetrics(StreamMetricsRequest) returns (stream MetricSample);
+
+  // CancelExperiment requests graceful cancellation of a running experiment.
+  rpc CancelExperiment(CancelExperimentRequest) returns (CancelExperimentResponse);
+
+  // GetExperimentReport retrieves the final report for a completed experiment.
+  rpc GetExperimentReport(GetExperimentReportRequest) returns (ExperimentReport);
+}
+
+// ============================================================================
+// RPC Request / Response Messages
+// ============================================================================
+
+message SubmitExperimentRequest {
+  ExperimentSpec spec = 1;
+}
+
+message SubmitExperimentResponse {
+  string experiment_id     = 1;
+  ExperimentState state    = 2;
+  string message           = 3;
+}
+
+message GetExperimentStatusRequest {
+  string experiment_id = 1;
+}
+
+message GetExperimentStatusResponse {
+  string experiment_id     = 1;
+  ExperimentState state    = 2;
+  string state_message     = 3;
+  uint32 cells_completed   = 4;
+  uint32 cells_total       = 5;
+}
+
+message StreamMetricsRequest {
+  string experiment_id = 1;
+}
+
+message MetricSample {
+  string experiment_id              = 1;
+  google.protobuf.Timestamp ts     = 2;
+  uint32 current_tp_degree         = 3;
+  uint32 current_batch_size        = 4;
+  double current_qps               = 5;
+  double current_ttft_p50_ms       = 6;
+  double current_itl_p50_ms        = 7;
+  repeated GPUMetrics gpu_snapshots = 8;
+}
+
+message CancelExperimentRequest {
+  string experiment_id = 1;
+}
+
+message CancelExperimentResponse {
+  ExperimentState state = 1;
+  string message        = 2;
+}
+
+message GetExperimentReportRequest {
+  string experiment_id = 1;
+}
