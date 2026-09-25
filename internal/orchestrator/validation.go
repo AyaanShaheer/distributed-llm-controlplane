@@ -1,9 +1,10 @@
-// Package validation provides server-side validation for all incoming API messages.
+// Package orchestrator provides the core experiment lifecycle engine, including
+// server-side validation for all incoming API messages.
 //
 // Protobuf does not enforce business invariants (e.g., "TP must be a power of 2").
 // This package bridges that gap with deterministic, pure-function validators that
 // return structured error lists without any I/O or side effects.
-package validation
+package orchestrator
 
 import (
 	"fmt"
